@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amodal3R - 深度精读</title>
+<style>
+:root{--text:#1f2937;--bg:#fbfbf8;--accent:#2563eb;--accent2:#0f766e;--muted:#6b7280;--border:#e5e7eb;--panel:#ffffff;--soft:#eef4ff;--code:#f3f4f6}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;font-size:17px}
+main{max-width:920px;margin:0 auto;padding:42px 22px 72px}
+h1{font-size:2.25rem;line-height:1.25;margin:0 0 10px;color:#111827}
+h2{font-size:1.42rem;margin:42px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border);color:var(--accent)}
+h3{font-size:1.08rem;margin:24px 0 8px;color:#111827}
+p{margin:12px 0}
+a{color:var(--accent);text-decoration:none}
+table{width:100%;border-collapse:collapse;margin:18px 0;background:var(--panel);font-size:.94rem}
+th,td{border:1px solid var(--border);padding:9px 11px;text-align:left;vertical-align:top}
+th{background:#f8fafc;color:#111827}
+code{background:var(--code);padding:2px 5px;border-radius:4px;font-family:"SF Mono","Menlo",monospace;font-size:.9em}
+pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow:auto}
+.meta{color:var(--muted);font-size:.95rem;margin-bottom:28px}
+.summary{background:linear-gradient(135deg,#eff6ff,#f0fdfa);border:1px solid #dbeafe;border-radius:12px;padding:18px 20px;margin:22px 0}
+.summary strong{color:#0f172a}
+.callout{background:#fff;border-left:4px solid var(--accent2);padding:12px 16px;margin:18px 0;border-radius:0 8px 8px 0}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.muted{color:var(--muted)}
+.golden{margin:34px 0 0;padding:20px;border-top:2px solid var(--accent);border-bottom:2px solid var(--accent);text-align:center;color:var(--accent);font-weight:700;font-size:1.18rem}
+@media(max-width:760px){main{padding:28px 16px 56px}h1{font-size:1.7rem}.grid{grid-template-columns:1fr}table{font-size:.86rem}}
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]})"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:"default",securityLevel:"loose"});</script>
+</head>
+<body>
+<main>
+<h1>Amodal3R: 从遮挡 2D 图像重建完整 3D 物体</h1>
+<div class="meta">
+标题：Amodal3R: Amodal 3D Reconstruction from Occluded 2D Images<br>
+作者：Tianhao Wu, Chuanxia Zheng, Frank Guan, Andrea Vedaldi, Tat-Jen Cham<br>
+论文：arXiv:2503.13439 · 本地 PDF：Amodal3R_2503.13439.pdf<br>
+代码状态：论文主页给出 GitHub 仓库链接，但本次本地克隆 GitHub 失败，因此本文不做源码逐行对照，只标注方法层面的实现位置。
+</div>
+
+<section class="summary">
+<strong>一句话总结：</strong>Amodal3R 把“遮挡补全”从 2D 像素修补问题改写成 3D 条件生成问题：它不先补出一张完整 2D 图再重建 3D，而是在 TRELLIS 的 3D latent denoising 流程中显式注入可见区域 mask 和遮挡区域 mask，让模型直接生成完整、合理、纹理一致的 3D asset。
+</section>
+
+<h2>1. 研究背景与动机</h2>
+<p>单图像 3D 重建在过去几年快速发展，TRELLIS、Real3D、GaussianAnything、LaRa 等方法已经能从一张或多张图像中恢复高质量 3D 表示。但这些方法通常隐含一个前提：目标物体在输入图像里是完整可见的。真实场景很少满足这个条件，桌椅、玩具、车辆、包、食物等物体经常被其他物体遮挡。</p>
+<p>如果输入只看到物体的一部分，传统 image-to-3D 模型往往会把“看不见”误读成“物体不存在”。于是生成的 3D 结果可能缺胳膊少腿，或者在遮挡边界附近出现破碎几何。这个问题不是普通图像重建的小瑕疵，而是任务定义本身的缺口：模型需要做的是 amodal reconstruction，也就是恢复被遮挡但客观存在的完整对象。</p>
+<p>已有直观方案是两阶段 pipeline：先用 2D amodal completion 方法把遮挡图补成完整图，再把补全后的图送入 image-to-3D 模型。这种方式容易实现，但有两个根本问题。第一，2D 补全依赖图像外观先验，缺少真实 3D 几何约束。第二，多视角输入时，每个视角独立补全会产生不一致内容，后续 3D 重建器被互相冲突的视图误导。</p>
+<p>Amodal3R 的出发点很清楚：不要把 3D 问题拆成一个不稳定的 2D 补全问题，再交给 3D 重建器收拾残局。它选择直接在 3D 生成模型内部处理遮挡，让模型同时完成可见部分重建、不可见部分推理和多视角一致性维护。</p>
+
+<h2>2. 方法总览</h2>
+<pre class="mermaid">
+flowchart LR
+    A["Input image + point prompts"] --> B["2D segmenter"]
+    B --> C["Visible object mask M_vis"]
+    B --> D["Occluder mask M_occ"]
+    A --> E["DINOv2 image tokens c_dino"]
+    C --> F["Patch weights c_vis"]
+    D --> G["Patch weights c_occ"]
+    E --> H["TRELLIS-based 3D diffusion"]
+    F --> I["Mask-weighted cross-attention"]
+    G --> J["Occlusion-aware attention"]
+    I --> H
+    J --> H
+    H --> K["Complete 3D asset"]
+</pre>
+<p>论文 Figure 2 给出了整体框架。输入是一张包含遮挡物体的图像和兴趣区域提示。系统先用 2D segmenter 得到两个 mask：目标物体可见区域 $M_{vis}$ 和遮挡物区域 $M_{occ}$。DINOv2 从被遮挡图像中提取图像 token $c_{dino}$，mask 被 patchify 成与 DINO token 对齐的权重序列 $c_{vis}$ 和 $c_{occ}$。</p>
+<p>这些条件不是简单拼接到图像 token 后丢给模型，而是被放进两个专门机制：mask-weighted cross-attention 负责让模型更相信可见目标区域，occlusion-aware attention 负责告诉模型哪些区域是“可能存在目标但被挡住”的区域。</p>
+
+<h2>3. 预备知识：TRELLIS 与 3D latent diffusion</h2>
+<p>Amodal3R 不是从零设计 3D 生成器，它建立在 TRELLIS 之上。TRELLIS 的核心是 Structured Latent，也就是把 3D 对象表示成一组稀疏体素位置及其局部 latent feature：</p>
+<p>$$z=\{(z_i,p_i)\}_{i=1}^{L}$$</p>
+<p>其中 $p_i$ 是活跃体素位置，$z_i$ 是该位置上的局部 latent 特征。人话解释：模型只在物体表面附近放置少量有效 token，而不是在完整 $N^3$ 体素网格上浪费计算。</p>
+<p>TRELLIS 包含两个扩散阶段：第一阶段预测 active voxel centers，也就是物体大体结构；第二阶段恢复对应的 structured latents，也就是更细的几何和外观。扩散训练目标写成：</p>
+<p>$$\min_{\theta}\mathbb{E}_{(\ell^{(0)},x),t,\epsilon}\left\|\upsilon_{\theta}(\ell^{(t)},x,t)-(\epsilon-\ell^{(0)})\right\|_2^2$$</p>
+<p>这里 $\ell^{(0)}$ 是真实 latent，$\ell^{(t)}$ 是加噪后的 latent，$\epsilon$ 是高斯噪声，$\upsilon_{\theta}$ 学习从 noisy latent 中预测去噪方向。人话解释：它在 3D latent space 里一步步把噪声变成结构化 3D 物体。</p>
+
+<h2>4. 核心创新一：Mask-weighted Cross-Attention</h2>
+<p>论文 Figure 3 展示了 Amodal3R 对 TRELLIS transformer block 的改造。第一个关键修改是 mask-weighted cross-attention。普通 cross-attention 会计算 latent query 和图像 token key 之间的相似度：</p>
+<p>$$q=W_q\ell,\quad [k,v]=W_{kv}c_{dino},\quad S=\frac{qk^\top}{\sqrt{D}}$$</p>
+<p>这里 $\ell$ 是 3D latent token，$c_{dino}$ 是 DINOv2 图像特征，$S$ 是每个 3D token 对每个图像 patch 的注意力打分。普通模型的问题是：遮挡物、背景、可见物体都会参与注意力，模型可能从错误区域读取条件。</p>
+<p>Amodal3R 用可见 mask 生成 patch 权重 $c_{vis,j}\in[0,1]$，表示第 $j$ 个图像 patch 中目标可见像素所占比例。然后把这个权重放进 attention softmax：</p>
+<p>$$A_{ij}=\frac{c_{vis,j}\exp(S_{ij})}{\sum_{k=1}^{K}c_{vis,k}\exp(S_{ik})}$$</p>
+<p>人话解释：如果一个 patch 目标完全不可见，$c_{vis,j}=0$，它对 attention 的贡献就是 0；如果一个 patch 目标清晰可见，它的图像特征会被更强地利用。这个设计不是硬裁图，而是平滑地调制注意力，保留了 transformer 结构的可训练性。</p>
+<p>这个机制的价值在于“少改动地利用 mask”。如果把 mask token 直接拼接给 transformer，预训练模型可能忽略这些低信息量 token，或者需要激进 fine-tuning 才能适配。mask-weighted attention 把 mask 作为 attention 权重的一部分，更直接、更稳定。</p>
+
+<h2>5. 核心创新二：Occlusion-aware Attention Layer</h2>
+<p>只有 $M_{vis}$ 还不够。不可见区域有两种含义：一种是纯背景，目标本来就不在那里；另一种是遮挡物前景，目标可能在后面继续延伸。Amodal3R 用 $M_{occ}$ 明确区分这两种情况。</p>
+<p>方法是在 mask-weighted cross-attention 后面再接一个 occlusion-aware cross-attention layer，它单独读取 occlusion mask token $c_{occ}$。论文中的设计意图是：第一层尽量从可见区域提取可靠外观和结构线索，第二层再根据遮挡位置推理应该补全的隐藏部分。</p>
+<p>附录 A.1 说明，输入图像分辨率为 $512\times512$，为了适配 DINOv2 patch size $14\times14$ 会 resize 到 $518\times518$，形成 $37\times37$ patch，再加 CLS token 和 register token，最终 $c_{dino}\in\mathbb{R}^{1374\times1024}$。mask 也被切成同样粒度，得到 $c_{vis}\in\mathbb{R}^{1374\times1}$ 和 $c_{occ}\in\mathbb{R}^{1374\times1}$。</p>
+<p>多头版本在附录中写为：</p>
+<p>$$A^h=\mathrm{softmax}(S^h+\log c_{vis})$$</p>
+<p>$$\mathrm{MHA}=[A^1v;A^2v;\ldots;A^Hv]$$</p>
+<p>人话解释：每个 attention head 都受到同一份可见性先验约束，但不同 head 仍然可以学习不同的几何或纹理关系。</p>
+
+<h2>6. 训练与遮挡模拟</h2>
+<p>真实世界中带完整 3D ground truth、真实遮挡、多视角一致标注的数据很难获得，因此作者选择合成训练。训练数据来自 3D-FUTURE、ABO 和 HSSD，共 20,627 个 synthetic 3D assets。附录说明 Amodal3R 在 4 张 A100 40G 上训练 20K steps，batch size 为 16，大约一天完成。</p>
+<p>随机 2D 遮挡通过线条、圆、椭圆、矩形等形状叠加生成。更重要的是多视角评估中的 3D-consistent masks：作者从 3D mesh 上随机选取三角面，再用 random-walk 扩展为连续区域，并用相同相机参数渲染 mask。这样不同视角下的遮挡是几何一致的，能更真实地测试多视角重建。</p>
+<p>多视角输入时，Amodal3R 不需要已知相机位姿，而是在 denoising 的不同 step 使用不同参考图像。因为早期 denoising 更影响粗几何，作者按可见面积 $|M_{vis}|$ 对视角排序，让可见信息更多的图像先参与生成。</p>
+
+<h2>7. 实验结果：为什么它有效</h2>
+<h3>7.1 GSO 数据集</h3>
+<table>
+<tr><th>方法</th><th>视角数</th><th>2D 补全</th><th>FID↓</th><th>KID↓</th><th>CLIP↑</th><th>P-FID↓</th><th>COV↑</th><th>MMD↓</th></tr>
+<tr><td>GaussianAnything</td><td>1</td><td>pix2gestalt</td><td>92.26</td><td>1.30</td><td>0.74</td><td>34.69</td><td>35.92</td><td>5.03</td></tr>
+<tr><td>Real3D</td><td>1</td><td>pix2gestalt</td><td>91.21</td><td>2.02</td><td>0.75</td><td>23.92</td><td>19.61</td><td>9.21</td></tr>
+<tr><td>TRELLIS</td><td>1</td><td>pix2gestalt</td><td>58.82</td><td>5.87</td><td>0.76</td><td>26.43</td><td>31.65</td><td>4.17</td></tr>
+<tr><td><strong>Amodal3R</strong></td><td>1</td><td>-</td><td><strong>30.64</strong></td><td><strong>0.35</strong></td><td><strong>0.81</strong></td><td><strong>7.69</strong></td><td><strong>39.61</strong></td><td><strong>3.62</strong></td></tr>
+<tr><td>TRELLIS</td><td>4</td><td>pix2gestalt+MV</td><td>60.37</td><td>1.85</td><td>0.83</td><td>19.68</td><td>31.75</td><td>4.21</td></tr>
+<tr><td><strong>Amodal3R</strong></td><td>4</td><td>-</td><td><strong>26.27</strong></td><td><strong>0.22</strong></td><td><strong>0.84</strong></td><td><strong>5.03</strong></td><td><strong>38.74</strong></td><td><strong>3.61</strong></td></tr>
+</table>
+<p>Table 1 最有说服力的点不是单个指标领先，而是多类指标一起领先。FID/KID 表示渲染图像质量，P-FID/MMD 表示 3D 几何质量，CLIP 表示语义一致性。Amodal3R 在这些维度同时提升，说明它不是只把纹理修漂亮，也不是只做粗糙几何补全。</p>
+
+<h3>7.2 Toys4K 数据集</h3>
+<table>
+<tr><th>方法</th><th>视角数</th><th>FID↓</th><th>KID↓</th><th>CLIP↑</th><th>P-FID↓</th><th>COV↑</th><th>MMD↓</th></tr>
+<tr><td>TRELLIS + pix2gestalt</td><td>1</td><td>43.05</td><td>6.83</td><td>0.80</td><td>26.04</td><td>26.28</td><td>6.87</td></tr>
+<tr><td><strong>Amodal3R</strong></td><td>1</td><td><strong>23.45</strong></td><td><strong>0.42</strong></td><td><strong>0.83</strong></td><td><strong>5.00</strong></td><td><strong>37.09</strong></td><td><strong>5.89</strong></td></tr>
+<tr><td>TRELLIS + pix2gestalt+MV</td><td>4</td><td>43.00</td><td>7.53</td><td>0.81</td><td>24.41</td><td>26.55</td><td>7.05</td></tr>
+<tr><td><strong>Amodal3R</strong></td><td>4</td><td><strong>20.93</strong></td><td><strong>0.50</strong></td><td><strong>0.85</strong></td><td><strong>3.78</strong></td><td><strong>39.03</strong></td><td><strong>5.75</strong></td></tr>
+</table>
+<p>Table 2 进一步说明方法不是只适配 GSO。特别值得注意的是，多视角两阶段 baseline 不一定比单视角更好，因为不同视角的 2D 补全会互相冲突。Amodal3R 则符合预期：使用更多遮挡视图时，结果继续变好。</p>
+
+<h2>8. 消融实验：两个模块各管什么</h2>
+<table>
+<tr><th>设计</th><th>FID↓</th><th>KID↓</th><th>COV↑</th><th>MMD↓</th><th>解释</th></tr>
+<tr><td>naive conditioning</td><td>31.96</td><td>0.49</td><td>37.96</td><td>3.61</td><td>直接拼 mask token，模型能学到一点补全，但纹理和几何都不稳定。</td></tr>
+<tr><td>only mask-weighted attention</td><td>30.53</td><td>0.38</td><td>36.90</td><td>3.69</td><td>可见区域纹理更好，但遮挡后面的几何推理仍可能出错。</td></tr>
+<tr><td>only occlusion-aware layer</td><td>31.77</td><td>0.57</td><td>40.19</td><td>3.51</td><td>几何覆盖更好，但外观一致性不足。</td></tr>
+<tr><td>full model</td><td>30.64</td><td>0.35</td><td>39.61</td><td>3.62</td><td>综合效果最好，说明两个模块互补。</td></tr>
+</table>
+<p>Figure 7 的定性结果更容易理解：naive concatenation 会出现形状不完整或纹理断裂；只有 $M_{vis}$ attention 时，模型知道看哪里，但不一定知道哪些空白要补；只有 $M_{occ}$ layer 时，几何可能完整但外观不够可信。完整模型同时解决“从哪里读可靠信息”和“在哪里推理隐藏结构”。</p>
+
+<h2>9. 讨论：这篇论文真正推进了什么</h2>
+<p>Amodal3R 的核心贡献不是“用了 SAM”或“用了 TRELLIS”，而是把遮挡先验变成 3D 生成器内部的条件控制。它没有把遮挡当作输入图像上的坏像素，而是把遮挡当作生成过程必须理解的结构信息。</p>
+<p>这个设计也解释了为什么两阶段方法在多视角时容易退化。2D completion 是每张图各自猜，猜错之后，3D 模型看到的是互相矛盾的证据。Amodal3R 直接在 3D latent space 汇合多视角证据，遮挡区域通过 mask 参与推理，而不是先被某个 2D 模型武断填满。</p>
+<p>应用层面，Amodal3R 对机器人感知、3D scene decomposition、AR/VR asset creation 都有意义。现实场景里的物体经常互相遮挡，如果 3D 重建系统只能处理完整物体，它就很难真正进入复杂场景。</p>
+
+<h2>10. 局限与风险</h2>
+<div class="grid">
+<div class="card">
+<h3>数据规模有限</h3>
+<p>作者在附录 C.6 中明确指出，由于计算资源限制，训练数据只有 20,627 个 synthetic 3D assets，且主要集中在家具类别。复杂或分布外物体可能产生不真实结构。</p>
+</div>
+<div class="card">
+<h3>真实世界适配不足</h3>
+<p>模型完全用 synthetic data 训练，无法充分利用真实环境中的上下文线索。真实遮挡、光照、接触关系和类别长尾仍可能造成失败。</p>
+</div>
+<div class="card">
+<h3>补全不可控</h3>
+<p>当前遮挡部分长什么样由模型采样决定。用户无法用文本、草图或交互约束指定补全风格，这限制了创作和工业使用。</p>
+</div>
+<div class="card">
+<h3>依赖 mask 质量</h3>
+<p>论文假设可以获得可见区域和遮挡区域 mask。真实使用中，如果 SAM 提示或分割结果错误，注意力引导也会偏离。</p>
+</div>
+</div>
+
+<h2>11. 代码对应状态</h2>
+<p>论文主页给出代码仓库 <code>https://github.com/Sm0kyWu/Amodal3R</code>。本次尝试本地克隆时遇到 GitHub 网络错误，因此无法完成源码级对应。基于论文结构，若代码可用，最值得检查的文件应对应以下组件：</p>
+<table>
+<tr><th>论文组件</th><th>应检查的实现点</th><th>原因</th></tr>
+<tr><td>mask-weighted cross-attention</td><td>Transformer cross-attention 中 softmax 前加入 <code>log c_vis</code></td><td>这是公式 (3) 和附录 (A.1) 的核心。</td></tr>
+<tr><td>occlusion-aware layer</td><td>每个 DiT block 后附加读取 <code>c_occ</code> 的 cross-attention</td><td>对应 Figure 3 中 Amodal3R 相对 TRELLIS 的结构增量。</td></tr>
+<tr><td>mask patchify</td><td>把 512/518 分辨率 mask 切成 14x14 patch 权重</td><td>决定 mask 与 DINOv2 token 是否对齐。</td></tr>
+<tr><td>multi-view ordering</td><td>按 <code>|M_vis|</code> 对输入视角排序</td><td>影响早期 denoising 的粗几何建立。</td></tr>
+</table>
+
+<h2>12. 结论</h2>
+<p>Amodal3R 的研究价值在于，它把 amodal completion 从“先补图再重建”的串联工程，提升为“遮挡感知的 3D 条件生成”。这种重写任务边界的思路，比单纯替换一个更强的 2D completion 模型更有生命力。</p>
+<p>如果只记住一个点：Amodal3R 不是在问“遮挡区域像什么”，而是在问“在这个 3D 物体上，哪些部分被挡住了，以及它们应该如何与可见部分几何和外观一致”。这就是它相对两阶段 pipeline 的根本优势。</p>
+
+<div class="golden">遮挡不是图像上的缺口，而是 3D 生成过程里的条件。</div>
+</main>
+</body>
+</html>
